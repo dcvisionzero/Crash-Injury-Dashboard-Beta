@@ -1,0 +1,446 @@
+---
+title: Last 7 Days
+queries:
+   - last_record: last_record.sql
+   - age_range: age_range.sql
+sidebar_position: 6
+---
+
+```sql unique_mode
+select 
+    MODE
+from crashes.crashes
+group by 1
+```
+
+```sql unique_severity
+select 
+    SEVERITY
+from crashes.crashes
+group by 1
+```
+
+```sql unique_hin
+select 
+    GIS_ID,
+    ROUTENAME
+from hin.hin
+group by all
+```
+
+```sql unique_dc
+select 
+    CITY_NAME
+from dc_boundary.dc_boundary
+group by 1
+```
+
+```sql inc_map
+WITH latest AS (
+    SELECT 
+        MAX(LAST_RECORD) AS raw_end_date,
+        date_trunc('day', MAX(LAST_RECORD)) AS end_date
+    FROM crashes.crashes
+),
+
+date_range AS (
+    SELECT 
+        (end_date - INTERVAL '6 day') AS start_date,
+        end_date,
+        (end_date + INTERVAL '1 day') AS end_date_exclusive
+    FROM latest
+),
+
+dates AS (
+    SELECT day 
+    FROM date_range,
+         generate_series(start_date, end_date, INTERVAL '1 day') AS t(day)
+),
+
+-- Crash type lookup table
+crash_map AS (
+    SELECT *
+    FROM (VALUES
+        ('single motor vehicle', 'MV-Obj'),
+        ('motor vehicle - motor vehicle', 'MV-MV'),
+        ('multiple motor vehicles', '>2 MV'),
+        ('single bicycle', 'Bic-Obj'),
+        ('bicycle - bicycle', 'Bic-Bic'),
+        ('multiple bicycles', 'Bic'),
+        ('pedestrian only', 'Ped-Obj'),
+        ('other', 'Oth-Obj'),
+        ('single motorcycle*', 'MC-Obj'),
+        ('single standing scooter*', 'SS-Obj'),
+        ('motor vehicle - pedestrian', 'MV-Ped'),
+        ('motor vehicle - bicycle', 'MV-Bic'),
+        ('motor vehicle - other', 'MV-Oth'),
+        ('motor vehicle - motorcycle*', 'MV-MC'),
+        ('motor vehicle - standing scooter*', 'MV-SS'),
+        ('other - bicycle', 'Oth-Bic'),
+        ('other - pedestrian', 'Oth-Ped'),
+        ('motorcycle* - pedestrian', 'MC-Ped'),
+        ('motorcycle* - bicycle', 'MC-Bic'),
+        ('standing scooter* - pedestrian', 'SS-Ped'),
+        ('standing scooter* - bicycle', 'SS-Bic'),
+        ('bicycle - pedestrian', 'Bic-Ped'),
+        ('multi-party', 'MP'),
+        ('unclassified', 'Unc')
+    ) AS t(TYPE_OF_CRASH, TYPE_ABBR)
+),
+
+-- 50-state street-name abbreviation lookup
+street_name_map AS (
+    SELECT *
+    FROM (VALUES
+        ('ALABAMA', 'AL'), ('ALASKA', 'AK'), ('ARIZONA', 'AZ'),
+        ('ARKANSAS', 'AR'), ('CALIFORNIA', 'CA'), ('COLORADO', 'CO'),
+        ('CONNECTICUT', 'CT'), ('DELAWARE', 'DE'), ('FLORIDA', 'FL'),
+        ('GEORGIA', 'GA'), ('HAWAII', 'HI'), ('IDAHO', 'ID'),
+        ('ILLINOIS', 'IL'), ('INDIANA', 'IN'), ('IOWA', 'IA'),
+        ('KANSAS', 'KS'), ('KENTUCKY', 'KY'), ('LOUISIANA', 'LA'),
+        ('MAINE', 'ME'), ('MARYLAND', 'MD'), ('MASSACHUSETTS', 'MA'),
+        ('MICHIGAN', 'MI'), ('MINNESOTA', 'MN'), ('MISSISSIPPI', 'MS'),
+        ('MISSOURI', 'MO'), ('MONTANA', 'MT'), ('NEBRASKA', 'NE'),
+        ('NEVADA', 'NV'), ('NEW HAMPSHIRE', 'NH'), ('NEW JERSEY', 'NJ'),
+        ('NEW MEXICO', 'NM'), ('NEW YORK', 'NY'), ('NORTH CAROLINA', 'NC'),
+        ('NORTH DAKOTA', 'ND'), ('OHIO', 'OH'), ('OKLAHOMA', 'OK'),
+        ('OREGON', 'OR'), ('PENNSYLVANIA', 'PA'), ('RHODE ISLAND', 'RI'),
+        ('SOUTH CAROLINA', 'SC'), ('SOUTH DAKOTA', 'SD'), ('TENNESSEE', 'TN'),
+        ('TEXAS', 'TX'), ('UTAH', 'UT'), ('VERMONT', 'VT'),
+        ('VIRGINIA', 'VA'), ('WASHINGTON', 'WA'), ('WEST VIRGINIA', 'WV'),
+        ('WISCONSIN', 'WI'), ('WYOMING', 'WY')
+    ) AS t(full_street, street_abbr)
+),
+
+filtered_crashes AS (
+    SELECT 
+        c.*,
+        date_trunc('day', c.REPORTDATE) AS crash_day,
+
+        ------------------------------------------------------------------
+        -- STEP 1: STREET-NAME ABBREVIATIONS (GEORGIA → GA, ALABAMA → AL)
+        ------------------------------------------------------------------
+        COALESCE(
+            (
+                SELECT REGEXP_REPLACE(c.ADDRESS, sn.full_street, sn.street_abbr)
+                FROM street_name_map sn
+                WHERE c.ADDRESS LIKE '%' || sn.full_street || '%'
+                LIMIT 1
+            ),
+            c.ADDRESS
+        ) AS ADDR1,
+
+        m.TYPE_ABBR,
+
+        CASE 
+            WHEN CAST(c.AGE AS INTEGER) = 120 THEN '-'
+            ELSE CAST(CAST(c.AGE AS INTEGER) AS VARCHAR)
+        END AS AGE_CLEAN,
+
+        -- CHANGE: AGE_TYPE now only TYPE_ABBR (no age)
+        m.TYPE_ABBR AS AGE_TYPE
+
+    FROM crashes.crashes c
+    JOIN date_range d
+        ON c.REPORTDATE >= d.start_date 
+       AND c.REPORTDATE < d.end_date_exclusive
+    LEFT JOIN crash_map m
+        ON c.TYPE_OF_CRASH = m.TYPE_OF_CRASH
+    WHERE c.MODE IN ${inputs.multi_mode_dd.value}
+      AND c.SEVERITY IN ${inputs.multi_severity.value}
+      AND c.AGE BETWEEN ${inputs.min_age.value}
+                     AND (
+                         CASE 
+                             WHEN ${inputs.min_age.value} <> 0 
+                                  AND ${inputs.max_age.value} = 120
+                             THEN 119
+                             ELSE ${inputs.max_age.value}
+                         END
+                     )
+)
+
+SELECT 
+    d.day,
+    COALESCE(fc.REPORTDATE, d.day) AS REPORTDATE,
+    STRFTIME('%m/%d %a', d.day) AS WEEKDAY,
+    COALESCE(fc.LATITUDE, 0) AS LATITUDE,
+    COALESCE(fc.LONGITUDE, 0) AS LONGITUDE,
+
+    -- Original MODESEV (kept)
+    SUBSTRING(fc.MODE, 1, 3) || '-' || SUBSTRING(fc.SEVERITY, 1) AS MODESEV,
+
+    -- NEW: age + space + MODESEV (your requested format)
+    (fc.AGE_CLEAN || ' ' || SUBSTRING(fc.MODE, 1, 3) || '-' || SUBSTRING(fc.SEVERITY, 1)) AS AGE_MODESEV,
+
+    ------------------------------------------------------------------
+    -- FINAL ADDRESS CLEANUP PIPELINE (unchanged)
+    ------------------------------------------------------------------
+    TRIM(
+        REGEXP_REPLACE(
+            REGEXP_REPLACE(
+                REGEXP_REPLACE(
+                    REGEXP_REPLACE(
+                        REGEXP_REPLACE(
+                            REGEXP_REPLACE(
+                                -- STEP 2: STREET-TYPE ABBREVIATIONS
+                                REGEXP_REPLACE(
+                                    REGEXP_REPLACE(
+                                        REGEXP_REPLACE(
+                                            REGEXP_REPLACE(
+                                                REGEXP_REPLACE(
+                                                    REGEXP_REPLACE(
+                                                        REGEXP_REPLACE(
+                                                            REGEXP_REPLACE(
+                                                                REGEXP_REPLACE(
+                                                                    REGEXP_REPLACE(
+                                                                        REGEXP_REPLACE(
+                                                                            fc.ADDR1,
+                                                                            '\\bSTREET\\b', 'ST'
+                                                                        ),
+                                                                        '\\bAVENUE\\b', 'AVE'
+                                                                    ),
+                                                                    '\\bROAD\\b', 'RD'
+                                                                ),
+                                                                '\\bPLACE\\b', 'PL'
+                                                            ),
+                                                            '\\bCOURT\\b', 'CT'
+                                                        ),
+                                                        '\\bCIRCLE\\b', 'CIR'
+                                                    ),
+                                                    '\\bBOULEVARD\\b', 'BLVD'
+                                                ),
+                                                '\\bDRIVE\\b', 'DR'
+                                            ),
+                                            '\\bTERRACE\\b', 'TER'
+                                        ),
+                                        '\\bPARKWAY\\b', 'PKWY'
+                                    ),
+                                    '\\bEXPRESSWAY\\b', 'EXPY'
+                                ),
+                                '\\bLANE\\b', 'LN'
+                            ),
+                            -- STEP 3: REMOVE INTERSTATE BN (after WA replacement)
+                            'INTERSTATE BN( WA,)?', ''
+                        ),
+                        -- STEP 4: REMOVE WASHINGTON, and WA,
+                        'WASHINGTON,', ''
+                    ),
+                    '\\b[A-Z]{2},', ''   -- STEP 5: remove any state abbreviation + comma
+                ),
+                '  +', ' '             -- STEP 6: collapse double spaces
+            ),
+            ',$', ''                  -- STEP 7: remove trailing comma
+        )
+    ) AS ADDRESS,
+
+    fc.CCN,
+    fc.TYPE_OF_CRASH,
+    fc.TYPE_ABBR,
+    fc.AGE_CLEAN AS AGE,
+    fc.AGE_TYPE,
+    COALESCE(fc.COUNT, 0) AS COUNT
+
+FROM dates d
+LEFT JOIN filtered_crashes fc
+    ON fc.crash_day = d.day
+ORDER BY d.day DESC;
+```
+
+```sql mode_severity_selection
+WITH
+  -- 1. Get the total number of unique modes in the entire table
+  total_modes_cte AS (
+    SELECT
+      COUNT(DISTINCT MODE) AS total_mode_count
+    FROM
+      crashes.crashes
+  ),
+  -- 2. Aggregate the modes, applying pluralization before aggregating
+  mode_agg_cte AS (
+    SELECT
+      STRING_AGG(
+        DISTINCT CASE
+          -- If the mode ends with '*', insert 's' before it
+          WHEN MODE LIKE '%*' THEN REPLACE(MODE, '*', 's*')
+          -- Otherwise, just append 's'
+          ELSE MODE || 's'
+        END,
+        ', '
+        ORDER BY
+          MODE ASC
+      ) AS mode_list,
+      COUNT(DISTINCT MODE) AS mode_count
+    FROM
+      crashes.crashes
+    WHERE
+      MODE IN ${inputs.multi_mode_dd.value}
+  ),
+  -- 3. Aggregate severities based on the INTERSECTION of both inputs
+  severity_agg_cte AS (
+    SELECT
+        COUNT(DISTINCT SEVERITY) AS severity_count,
+        CASE
+        WHEN COUNT(DISTINCT SEVERITY) = 0 THEN ' '
+        WHEN BOOL_AND(SEVERITY IN ('Fatal')) THEN 'Fatalities'
+        WHEN BOOL_AND(SEVERITY IN ('Major', 'Fatal')) AND COUNT(DISTINCT SEVERITY) = 2 THEN 'Major Injuries and Fatalities'
+        WHEN BOOL_AND(SEVERITY IN ('Minor', 'Major')) AND COUNT(DISTINCT SEVERITY) = 2 THEN 'Minor and Major Injuries'
+        WHEN BOOL_AND(SEVERITY IN ('Minor', 'Major', 'Fatal')) AND COUNT(DISTINCT SEVERITY) = 3 THEN 'Minor and Major Injuries, Fatalities'
+        ELSE STRING_AGG(
+            DISTINCT CASE
+            WHEN SEVERITY = 'Fatal' THEN 'Fatalities'
+            WHEN SEVERITY = 'Major' THEN 'Major Injuries'
+            WHEN SEVERITY = 'Minor' THEN 'Minor Injuries'
+            END,
+            ', '
+            ORDER BY
+            CASE SEVERITY
+                WHEN 'Minor' THEN 1
+                WHEN 'Major' THEN 2
+                WHEN 'Fatal' THEN 3
+            END
+        )
+        END AS severity_list
+    FROM
+        crashes.crashes
+    WHERE
+        MODE IN ${inputs.multi_mode_dd.value}
+        AND SEVERITY IN ${inputs.multi_severity.value}
+    )
+-- 4. Combine results and apply final formatting logic to each column
+SELECT
+  CASE
+    WHEN mode_count = 0 THEN ' '
+    WHEN mode_count = total_mode_count THEN 'All Road Users (RU)'
+    WHEN mode_count = 1 THEN mode_list
+    WHEN mode_count = 2 THEN REPLACE(mode_list, ', ', ' and ')
+    ELSE REGEXP_REPLACE(mode_list, ',([^,]+)$', ', and \\1')
+  END AS MODE_SELECTION,
+  CASE
+    WHEN severity_count = 0 THEN ' '
+    WHEN severity_count = 1 THEN severity_list
+    WHEN severity_count = 2 THEN REPLACE(severity_list, ', ', ' and ')
+    ELSE REGEXP_REPLACE(severity_list, ',([^,]+)$', ', and \\1')
+    END AS SEVERITY_SELECTION
+FROM
+  mode_agg_cte,
+  severity_agg_cte,
+  total_modes_cte;
+```
+
+The last 7 days with available data range from <Value data={inc_map} column="WEEKDAY" agg="min"/> to <Value data={inc_map} column="WEEKDAY" agg="max" />
+
+<Dropdown
+    data={unique_severity} 
+    name=multi_severity
+    value=SEVERITY
+    title="Severity"
+    multiple=true
+    defaultValue={["Major","Fatal"]}
+/>
+
+<Dropdown
+    data={unique_mode} 
+    name=multi_mode_dd
+    value=MODE
+    title="Road User"
+    multiple=true
+    selectAllByDefault=true
+    description="*Only fatal"
+/>
+
+<Dropdown 
+    data={age_range} 
+    name=min_age
+    value=age_int
+    title="Min Age" 
+    defaultValue={0}
+/>
+
+<Dropdown 
+    data={age_range} 
+    name="max_age"
+    value=age_int
+    title="Max Age"
+    order="age_int desc"
+    defaultValue={120}
+    description='Age 120 serves as a placeholder for missing age values in the records. However, missing values will be automatically excluded from the query if the default 0-120 range is changed by the user. To get a count of missing age values, go to the "Age Distribution" page.'
+/>
+
+<script>
+  let isDesktop = false;
+
+  onMount(() => {
+    isDesktop = window.innerWidth >= 768;
+    const handleResize = () => { isDesktop = window.innerWidth >= 768; };
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  });
+</script>
+
+<Grid cols=2>
+    <Group>
+        <div style="font-size: 14px;">
+            <b>Last 7 Days - Map of {`${mode_severity_selection[0].SEVERITY_SELECTION}`} for {`${mode_severity_selection[0].MODE_SELECTION}`}</b>
+        </div>
+        <Note>
+            Each point on the map represents an injury. Injury incidents can overlap in the same spot.
+        </Note>
+        <BaseMap
+            height=450
+            startingZoom=11
+            basemap={`https://basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png?key=${import.meta.env.VITE_CARTO_KEY}`}
+            attribution='© <a href="https://carto.com/attributions">CARTO</a>, © <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+        >
+            <Points data={inc_map} lat=LATITUDE long=LONGITUDE pointName=MODE value=WEEKDAY ignoreZoom=true colorPalette={['#595cff','#6b76ff','#7d90ff','#90aaff','#a2c4ff','#b4deff','#c6f8ff']}
+            tooltip={[
+                {id:'MODESEV', showColumnName:false, fmt:'id', valueClass:'text-l font-semibold'},
+                {id:'CCN', showColumnName:false, fmt:'id'},
+                {id:'day', showColumnName:false, fmt:'mm/dd/yy'},
+                {id:'ADDRESS', showColumnName:false, fmt:'id'}
+            ]}
+            />
+            <Areas data={unique_hin} geoJsonUrl='https://raw.githubusercontent.com/rafaelmorenoco/Crash-Injury-Dashboard-Frontend/main/static/High_Injury_Network.geojson' geoId=GIS_ID areaCol=GIS_ID borderColor=#9d00ff color=#1C00ff00/ ignoreZoom=true borderWidth=1.2
+            tooltip={[
+                {id: 'ROUTENAME'}
+            ]}
+            />
+            <Areas data={unique_dc} geoJsonUrl='https://raw.githubusercontent.com/rafaelmorenoco/Crash-Injury-Dashboard-Frontend/main/static/dc_boundary.geojson' geoId=CITY_NAME areaCol=CITY_NAME opacity=0.5 borderColor=#000000 color=#1C00ff00/ 
+            />
+        </BaseMap>
+        <Note>
+            The purple lines represent DC's High Injury Network
+        </Note>
+    </Group>
+    <Group>
+        <DataTable data={inc_map} title="Last 7 Days - Table of {`${mode_severity_selection[0].SEVERITY_SELECTION}`} for {`${mode_severity_selection[0].MODE_SELECTION}`}" wrapTitles=true rowShading=true groupBy=WEEKDAY subtotals=true sort="day desc" totalRow=true accordionRowColor="#D3D3D3">
+            {#if isDesktop}
+                <Column id=REPORTDATE title="Date" fmt='hh:mm' wrap=true totalAgg="Total"/>
+                <Column id=AGE title="Age" wrap=true totalAgg="-"/>
+                <Column id=MODESEV title="Road User - Sev" wrap=true/>
+                <Column id=TYPE_ABBR title="Crash" wrap=true totalAgg="-"/>
+                <Column id=CCN title="CCN" wrap=true/>                 
+                <Column id=ADDRESS title="Approx Address" wrap=true/>
+                <Column id=COUNT title="#" wrap=true/>
+            {/if}
+            {#if !isDesktop}
+                <Column id=REPORTDATE title="Date" fmt='hh:mm' wrap=true totalAgg="Total"/>
+                <Column id=AGE_MODESEV title="Age - RU - Sev" wrap=true/>
+                <Column id=TYPE_ABBR title="Crash Type" wrap=true totalAgg="-"/>
+                <Column id=ADDRESS title="Approx Address" wrap=true/>
+                <Column id=COUNT title="#" wrap=true/>
+            {/if}
+        </DataTable>
+    </Group>
+</Grid>
+
+<Note>
+    <b>Crash type abbreviations</b>: Motor Vehicle (MV), Bicycle (Bic), Pedestrian (Ped), Other (Oth), Motorcycle* (MC*), Standing Scooter* (SS*), Multi-party (MP), Object (Obj), Unclassified (Unc).
+</Note>
+
+<Note>
+    State avenues are abbreviated. Ex: Massachusetts → MA. 
+</Note>
+
+<Note>
+    The latest crash record in the dataset is from <Value data={last_record} column="latest_record"/> and the data was last updated on <Value data={last_record} column="latest_update"/> hrs.
+</Note>

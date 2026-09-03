@@ -213,7 +213,7 @@ ORDER BY r.day_number;
 SELECT
     h.GRID_ID,
     COALESCE(SUM(c.COUNT), 0) AS count,
-    '/Crash-Injury-Dashboard/hexgrid/' || h.GRID_ID AS link
+    '/Crash-Injury-Dashboard-Beta/hexgrid/' || h.GRID_ID AS link
 FROM hexgrid.crash_hexgrid h
 LEFT JOIN crashes.crashes c 
     ON h.GRID_ID = c.GRID_ID
